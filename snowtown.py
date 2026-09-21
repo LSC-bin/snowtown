@@ -41,7 +41,8 @@ RESET = CSI + "0m"
 class Palette:
     """트루컬러 → 256색 → 단색으로 자동 강등."""
 
-    def __init__(self, mode: str = "auto"):
+    def __init__(self, mode: str = "auto", bg_enabled: bool = True):
+        self.bg_enabled = bg_enabled
         if mode == "auto":
             ct = os.environ.get("COLORTERM", "").lower()
             mode = "truecolor" if ("truecolor" in ct or "24bit" in ct) else "256"
@@ -49,7 +50,7 @@ class Palette:
 
     def bg_code(self, rgb: tuple[int, int, int]) -> str:
         r, g, b = rgb
-        if self.mode == "none":
+        if self.mode == "none" or not self.bg_enabled:
             return ""
         if self.mode == "truecolor":
             return f"{CSI}48;2;{r};{g};{b}m"
@@ -374,24 +375,27 @@ class World:
 
 
 def render_ansi(cv: Canvas, pal: Palette) -> str:
-    out = [CSI + "H"]
+    """행마다 절대 좌표로 이동해 그린다.
+
+    개행(\n)에 의존하면 터미널의 자동 줄바꿈과 겹쳐 행이 밀리거나 화면이
+    스크롤되는 문제가 생긴다(특히 macOS Terminal.app). 절대 좌표 + 줄 끝
+    지우기(EL)로 프레임을 겹쳐 그리면 그런 문제가 없다.
+    """
+    out = []
     for y in range(cv.h):
+        out.append(f"{CSI}{y + 1};1H")
         last_fg = last_bg = None
-        buf = []
         for x in range(cv.w):
             ch, col, bg = cv.cell(x, y)
             if bg != last_bg or col != last_fg:
-                buf.append(RESET)
+                out.append(RESET)
                 if bg:
-                    buf.append(pal.bg_code(bg))
+                    out.append(pal.bg_code(bg))
                 if col:
-                    buf.append(pal.fg(col))
+                    out.append(pal.fg(col))
                 last_fg, last_bg = col, bg
-            buf.append(ch)
-        buf.append(RESET + CSI + "K")
-        out.append("".join(buf))
-        if y != cv.h - 1:
-            out.append("\n")
+            out.append(ch)
+        out.append(RESET + CSI + "K")
     return "".join(out)
 
 
@@ -520,7 +524,8 @@ class Terminal:
     키 토큰: 'LEFT' 'RIGHT' 'UP' 'DOWN' 또는 문자 1개 ('q', ' ', 'a' ...)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, use_alt: bool = True) -> None:
+        self.use_alt = use_alt
         self.windows = IS_WINDOWS
         self._old_attr = None
         self._old_in_mode = None
@@ -535,7 +540,11 @@ class Terminal:
             fd = sys.stdin.fileno()
             self._old_attr = termios.tcgetattr(fd)
             tty.setraw(fd)
-        sys.stdout.write(CSI + "?1049h" + CSI + "?25l" + CSI + "2J")
+        # ?7l = 자동 줄바꿈 끔, ?1049h = 대체 화면(옵션), ?25l = 커서 숨김
+        seq = CSI + "?7l" + CSI + "?25l" + CSI + "2J"
+        if self.use_alt:
+            seq = CSI + "?7l" + CSI + "?1049h" + CSI + "?25l" + CSI + "2J"
+        sys.stdout.write(seq)
         sys.stdout.flush()
 
     def _setup_windows(self) -> None:
@@ -567,7 +576,10 @@ class Terminal:
 
     # --- 복원
     def restore(self) -> None:
-        sys.stdout.write(RESET + CSI + "?25h" + CSI + "?1049l")
+        tail = RESET + CSI + "?7h" + CSI + "?25h"
+        if self.use_alt:
+            tail += CSI + "?1049l"
+        sys.stdout.write(tail)
         sys.stdout.flush()
         if self.windows:
             k = self._win_kernel
@@ -624,8 +636,13 @@ class Terminal:
 
 
 def term_size() -> tuple[int, int]:
-    s = shutil.get_terminal_size((100, 32))
-    return max(40, s.columns), max(14, s.lines - 1)
+    """실제 터미널 크기. 창보다 크게 그리면 줄바꿈되어 화면이 깨지므로
+    임의로 키우지 않는다 (아주 작을 때만 최소값으로 방어)."""
+    try:
+        s = os.get_terminal_size(sys.__stdout__.fileno())
+    except (OSError, ValueError, AttributeError):
+        s = shutil.get_terminal_size((80, 24))
+    return max(20, s.columns), max(8, s.lines - 1)
 
 
 def apply_key(game: "Game", key: str, args) -> "Game":
@@ -644,7 +661,7 @@ def apply_key(game: "Game", key: str, args) -> "Game":
 
 
 def run(args) -> int:
-    pal = Palette("none" if args.no_color else "auto")
+    pal = Palette("none" if args.no_color else "auto", bg_enabled=not args.no_bg)
 
     # 검증용: 프레임 몇 장만 찍고 종료
     if args.frames:
@@ -663,7 +680,7 @@ def run(args) -> int:
 
     w, h = term_size()
     game = Game(w, h, demo=args.demo, seed=args.seed)
-    term = Terminal()
+    term = Terminal(use_alt=not args.no_alt)
     old_winch = None
 
     def on_winch(_sig, _frm):
@@ -704,6 +721,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="SnowTown — ASCII 코지 크리스마스 마을")
     ap.add_argument("--demo", action="store_true", help="조작 없이 감상 모드")
     ap.add_argument("--no-color", action="store_true", help="색 없이 출력")
+    ap.add_argument("--no-bg", action="store_true", help="배경색(하늘·눈밭) 없이 출력 — 배경색이 깨지는 터미널용")
+    ap.add_argument("--no-alt", action="store_true", help="대체 화면(alt screen) 없이 실행 — 화면이 겹치는 터미널용")
     ap.add_argument("--frames", type=int, default=0, help="검증용: N프레임만 출력하고 종료")
     ap.add_argument("--width", type=int, default=100)
     ap.add_argument("--height", type=int, default=30)

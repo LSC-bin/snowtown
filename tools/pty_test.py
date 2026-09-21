@@ -60,7 +60,7 @@ else:
     code = os.waitstatus_to_exitcode(status)
 
 text = buf.decode("utf-8", "ignore")
-frames = text.count("\x1b[H")
+frames = text.count("\x1b[1;1H")  # 절대좌표 렌더러 기준
 ok = (
     code == 0
     and frames > 20
