@@ -17,13 +17,20 @@ import argparse
 import math
 import os
 import random
-import select
 import shutil
 import signal
 import sys
-import termios
 import time
-import tty
+
+IS_WINDOWS = os.name == "nt"
+
+if IS_WINDOWS:  # 윈도우: msvcrt 로 비동기 키 입력
+    import ctypes
+    import msvcrt
+else:  # 유닉스: termios + select
+    import select
+    import termios
+    import tty
 
 # ---------------------------------------------------------------- 색
 
@@ -507,9 +514,133 @@ class Game:
 # ---------------------------------------------------------------- 터미널
 
 
+class Terminal:
+    """터미널 제어: 크기, raw 모드, 비동기 키 입력 (유닉스/윈도우 공용).
+
+    키 토큰: 'LEFT' 'RIGHT' 'UP' 'DOWN' 또는 문자 1개 ('q', ' ', 'a' ...)
+    """
+
+    def __init__(self) -> None:
+        self.windows = IS_WINDOWS
+        self._old_attr = None
+        self._old_in_mode = None
+        self._old_out_mode = None
+        self._win_kernel = None
+
+    # --- 준비
+    def setup(self) -> None:
+        if self.windows:
+            self._setup_windows()
+        else:
+            fd = sys.stdin.fileno()
+            self._old_attr = termios.tcgetattr(fd)
+            tty.setraw(fd)
+        sys.stdout.write(CSI + "?1049h" + CSI + "?25l" + CSI + "2J")
+        sys.stdout.flush()
+
+    def _setup_windows(self) -> None:
+        """콘솔 코드페이지 UTF-8 + VT 시퀀스 허용 + 입력 에코/라인모드 해제."""
+        k = ctypes.windll.kernel32
+        self._win_kernel = k
+        k.SetConsoleOutputCP(65001)
+        k.SetConsoleCP(65001)
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+        STD_OUT, STD_IN = -11, -10
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT = 0x0002, 0x0004
+
+        h_out = k.GetStdHandle(STD_OUT)
+        mode = ctypes.c_uint32()
+        if k.GetConsoleMode(h_out, ctypes.byref(mode)):
+            self._old_out_mode = mode.value
+            k.SetConsoleMode(h_out, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+
+        h_in = k.GetStdHandle(STD_IN)
+        imode = ctypes.c_uint32()
+        if k.GetConsoleMode(h_in, ctypes.byref(imode)):
+            self._old_in_mode = imode.value
+            k.SetConsoleMode(h_in, imode.value & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))
+
+    # --- 복원
+    def restore(self) -> None:
+        sys.stdout.write(RESET + CSI + "?25h" + CSI + "?1049l")
+        sys.stdout.flush()
+        if self.windows:
+            k = self._win_kernel
+            if k is not None:
+                if self._old_out_mode is not None:
+                    k.SetConsoleMode(k.GetStdHandle(-11), self._old_out_mode)
+                if self._old_in_mode is not None:
+                    k.SetConsoleMode(k.GetStdHandle(-10), self._old_in_mode)
+        elif self._old_attr is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old_attr)
+
+    # --- 키 입력 (논블로킹)
+    def read_keys(self) -> list[str]:
+        return self._read_keys_windows() if self.windows else self._read_keys_unix()
+
+    def _read_keys_windows(self) -> list[str]:
+        keys: list[str] = []
+        special = {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT"}
+        while msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):  # 확장 키 접두
+                nxt = msvcrt.getwch() if msvcrt.kbhit() else ""
+                token = special.get(nxt)
+                if token:
+                    keys.append(token)
+                continue
+            if ch == "\x03":  # Ctrl+C
+                keys.append("q")
+                continue
+            keys.append(ch)
+        return keys
+
+    def _read_keys_unix(self) -> list[str]:
+        keys: list[str] = []
+        fd = sys.stdin.fileno()
+        while select.select([fd], [], [], 0)[0]:
+            data = os.read(fd, 16)
+            if not data:
+                break
+            text = data.decode("utf-8", "ignore")
+            i = 0
+            while i < len(text):
+                ch = text[i]
+                if ch == "\x1b" and text[i + 1 : i + 2] == "[":
+                    code = text[i + 2 : i + 3]
+                    token = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(code)
+                    if token:
+                        keys.append(token)
+                    i += 3
+                    continue
+                keys.append(ch)
+                i += 1
+        return keys
+
+
 def term_size() -> tuple[int, int]:
     s = shutil.get_terminal_size((100, 32))
     return max(40, s.columns), max(14, s.lines - 1)
+
+
+def apply_key(game: "Game", key: str, args) -> "Game":
+    """키 토큰 → 게임 동작. 새 게임이 필요하면 반환한다."""
+    if key in ("q", "Q", "\x03"):
+        raise KeyboardInterrupt
+    if key in ("a", "A", "LEFT"):
+        game.world.move(-2)
+    elif key in ("d", "D", "RIGHT"):
+        game.world.move(2)
+    elif key in ("w", "W", " ", "UP"):
+        game.world.jump()
+    elif key in ("r", "R") and game.over:
+        return Game(game.w, game.h, demo=game.demo, seed=game.world.seed)
+    return game
 
 
 def run(args) -> int:
@@ -532,20 +663,18 @@ def run(args) -> int:
 
     w, h = term_size()
     game = Game(w, h, demo=args.demo, seed=args.seed)
-
-    fd = sys.stdin.fileno()
-    old_attr = termios.tcgetattr(fd)
-    old_winch = signal.getsignal(signal.SIGWINCH)
+    term = Terminal()
+    old_winch = None
 
     def on_winch(_sig, _frm):
         nw, nh = term_size()
         game.resize(nw, nh)
 
     try:
-        tty.setraw(fd)
-        sys.stdout.write(CSI + "?1049h" + CSI + "?25l" + CSI + "2J")
-        sys.stdout.flush()
-        signal.signal(signal.SIGWINCH, on_winch)
+        term.setup()
+        if not IS_WINDOWS:
+            old_winch = signal.getsignal(signal.SIGWINCH)
+            signal.signal(signal.SIGWINCH, on_winch)
 
         last = time.monotonic()
         while True:
@@ -553,41 +682,22 @@ def run(args) -> int:
             dt = min(0.1, now - last)
             last = now
 
-            # 입력
-            while select.select([sys.stdin], [], [], 0)[0]:
-                data = os.read(fd, 16)
-                if not data:
-                    break
-                for key in data.decode("utf-8", "ignore"):
-                    if key in ("q", "Q", "\x03"):
-                        return 0
-                    if key in ("a", "A"):
-                        game.world.move(-2)
-                    elif key in ("d", "D"):
-                        game.world.move(2)
-                    elif key in ("w", "W", " "):
-                        game.world.jump()
-                    elif key in ("r", "R") and game.over:
-                        game = Game(w, h, demo=args.demo, seed=args.seed)
-                    elif key == "\x1b":
-                        # 방향키 시퀀스
-                        seq = os.read(fd, 2).decode("utf-8", "ignore") if select.select([sys.stdin], [], [], 0.01)[0] else ""
-                        if seq.endswith("C"):
-                            game.world.move(2)
-                        elif seq.endswith("D"):
-                            game.world.move(-2)
-                        elif seq.endswith("A"):
-                            game.world.jump()
+            for key in term.read_keys():
+                game = apply_key(game, key, args)
+
+            if IS_WINDOWS:  # 윈도우는 SIGWINCH가 없어 주기적으로 크기 확인
+                game.resize(*term_size())
 
             game.update(dt)
             sys.stdout.write(render_ansi(game.draw(), pal))
             sys.stdout.flush()
             time.sleep(max(0.0, 1 / 24 - (time.monotonic() - now)))
+    except KeyboardInterrupt:
+        return 0
     finally:
-        signal.signal(signal.SIGWINCH, old_winch)
-        sys.stdout.write(RESET + CSI + "?25h" + CSI + "?1049l")
-        sys.stdout.flush()
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
+        if old_winch is not None:
+            signal.signal(signal.SIGWINCH, old_winch)
+        term.restore()
 
 
 def main() -> int:

@@ -7,12 +7,41 @@ ASCII 문자만으로 그리는 아늑한 겨울 마을 미니게임. 표준 라
 
 ## 실행
 
+### macOS / Linux
+
 ```bash
 cd "$HOME/hermes agent/snowtown"
 python3 snowtown.py             # 게임 시작 (60초 동안 떨어지는 선물 받기)
 python3 snowtown.py --demo      # 조작 없이 감상 (수업 프로젝션·스크린세이버용)
 python3 snowtown.py --no-color  # 색 없이 (단색 터미널)
 ```
+
+### Windows
+
+**준비 (최초 1회)** — Python 3.8 이상이 필요합니다.
+
+```powershell
+winget install Python.Python.3.12
+```
+
+또는 python.org 에서 설치할 때 **"Add python.exe to PATH"** 를 반드시 체크하세요.
+터미널은 **Windows Terminal**(Microsoft Store에서 무료)을 권장합니다. (Windows 10 1809+ / 11)
+
+**실행** — 저장소 폴더에서:
+
+```bat
+run.bat                 :: 더블클릭해도 됨
+run.bat --demo          :: 감상 모드
+py -3 snowtown.py       :: 직접 실행
+```
+
+`run.bat` 은 UTF-8 코드페이지를 켜고(`chcp 65001`) `py`/`python` 을 자동으로 골라 실행하며,
+오류가 나면 창이 닫히지 않고 메시지를 보여줍니다.
+
+윈도우 관련 참고:
+- 윈도우에서는 `msvcrt` 로 키 입력을 받고, 콘솔 모드(VT 시퀀스 허용)를 코드에서 켜므로 별도 설정이 필요 없습니다.
+- 아주 오래된 레거시 콘솔에서는 색이 256색으로 떨어질 수 있습니다(동작은 동일).
+- `Ctrl+C` 로 언제든 종료할 수 있고, 종료 시 화면·커서 상태를 원래대로 되돌립니다.
 
 색은 트루컬러 → 256색 → 단색으로 자동 강등되므로 어떤 터미널에서도 동작합니다.
 
@@ -40,7 +69,8 @@ python3 snowtown.py --no-color  # 색 없이 (단색 터미널)
 
 ```
 snowtown/
-├── snowtown.py          # 게임 본체 (렌더러 + 게임 루프 + 터미널 제어)
+├── snowtown.py          # 게임 본체 (렌더러 + 게임 루프 + 터미널 제어, 유닉스/윈도우 공용)
+├── run.bat              # 윈도우 실행 런처
 ├── tools/
 │   ├── preview.py       # 프레임을 HTML로 렌더 (스크린샷 검증용)
 │   ├── html_shot.mjs    # HTML → PNG (headless Chromium)
@@ -61,6 +91,7 @@ snowtown/
 | 낮밤 주기 | `World.sky_color()` 의 `90.0` |
 | 마을 밀도 | `World.build()` 의 건물 폭·간격·높이 |
 | 선물 생성 빈도 | `Game.update()` 의 `random.uniform(0.75, 1.6)` |
+| 플랫폼별 터미널 처리 | `class Terminal` (유닉스 `termios`/`select` ↔ 윈도우 `msvcrt`) |
 
 ## 검증
 
